@@ -70,7 +70,7 @@ class ASRPipeline:
             self.model.to(self.device)
             self.model.eval()
             
-            # Create the pipeline
+            # Create the pipeline with chunking for long-form audio
             self._pipeline = pipeline(
                 "automatic-speech-recognition",
                 model=self.model,
@@ -78,7 +78,9 @@ class ASRPipeline:
                 feature_extractor=self.processor.feature_extractor,
                 device=self.device if self.device != "mps" else -1,  # MPS not supported via device param
                 torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
-                model_kwargs={"use_safetensors": True}
+                model_kwargs={"use_safetensors": True},
+                chunk_length_s=30,  # Enable overlap-add chunking for audio > 30s
+                stride_length_s=(4, 2)  # Stride: 4s left, 2s right overlap
             )
             
             logger.info(f"Successfully loaded Whisper {model_size} on {self.device}")

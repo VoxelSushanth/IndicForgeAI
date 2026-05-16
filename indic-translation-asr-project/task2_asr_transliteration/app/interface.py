@@ -9,8 +9,9 @@ upload, recording, model selection, and output display components.
 import logging
 import threading
 import uuid
+import asyncio
 from pathlib import Path
-from typing import Tuple, Dict, Any, Optional
+from typing import Tuple, Dict, Any, Optional, AsyncGenerator
 
 import gradio as gr
 
@@ -60,58 +61,68 @@ def build_interface(
             - Clear button
     """
     
-    def process_audio(
+    async def process_audio(
         audio_path: Optional[str],
         model_size: str,
         target_scheme: str
-    ) -> Tuple[str, str, Dict[str, Any]]:
+    ) -> AsyncGenerator[Tuple[str, str, Dict[str, Any]], None]:
         """
-        Process uploaded or recorded audio through ASR pipeline.
-        
+        Process uploaded or recorded audio through ASR pipeline asynchronously.
+
         This function orchestrates the complete transcription and
         transliteration workflow using the producer-consumer pattern:
         1. Preprocesses audio to extract audio array
         2. Generates a unique job ID
         3. Enqueues audio with metadata into the buffer manager
-        4. Waits for the background worker to complete processing
-        5. Returns results from the thread-safe response dictionary
-        
+        4. Polls asynchronously for the background worker to complete processing
+        5. Yields live status updates and returns results from the thread-safe response dictionary
+
         Args:
             audio_path: Path to audio file (from upload or recording)
             model_size: Whisper model size ("small" or "medium")
             target_scheme: Target transliteration scheme
-        
-        Returns:
+
+        Yields:
             Tuple of (transcript, transliteration, metadata_dict)
-            On error, returns error message in transcript field
+            On error, yields error message in transcript field
         """
         try:
             # Validate input
             if audio_path is None:
-                return (
+                yield (
                     "Please upload or record audio first.",
                     "",
                     {"error": "No audio provided"}
                 )
+                return
             
             audio_file = Path(audio_path)
             if not audio_file.exists():
-                return (
+                yield (
                     f"Audio file not found: {audio_path}",
                     "",
                     {"error": "File not found", "path": str(audio_path)}
                 )
+                return
             
             logger.info(f"Processing audio: {audio_path}, model: {model_size}")
+            
+            # Yield initial status update
+            yield (
+                "Queued...",
+                "",
+                {"status": "queued", "job_id": "pending"}
+            )
             
             # Get ASR pipeline from cache for preprocessing
             asr_pipeline = model_cache["asr_pipelines"].get(model_size)
             if asr_pipeline is None:
-                return (
+                yield (
                     f"Model '{model_size}' not available in cache.",
                     "",
                     {"error": f"Model '{model_size}' not initialized"}
                 )
+                return
             
             # Preprocess audio to get numpy array
             audio_array = asr_pipeline.preprocess_audio(str(audio_path))
@@ -138,73 +149,101 @@ def build_interface(
                 logger.error(f"Failed to enqueue job {job_id}")
                 with async_responses_lock:
                     del async_responses[job_id]
-                return (
+                yield (
                     "Error: Audio queue is full. Please try again.",
                     "",
                     {"error": "Queue full", "job_id": job_id}
                 )
+                return
             
             logger.info(f"Job {job_id} enqueued, waiting for processing...")
             
-            # Wait for background worker to complete (Consumer result)
-            # Timeout after 120 seconds to prevent indefinite blocking
-            completed = job_event.wait(timeout=120.0)
+            # Yield processing status update
+            yield (
+                "Processing Audio...",
+                "",
+                {"status": "processing", "job_id": job_id}
+            )
             
-            if not completed:
-                logger.error(f"Job {job_id} timed out")
+            # Asynchronous polling loop - non-blocking wait for worker completion
+            max_wait_time = 120  # Maximum wait time in seconds
+            elapsed_time = 0
+            poll_interval = 1  # Poll every 1 second
+            
+            while elapsed_time < max_wait_time:
+                # Check if job is completed
                 with async_responses_lock:
-                    del async_responses[job_id]
-                return (
-                    "Error: Processing timed out. Please try again.",
-                    "",
-                    {"error": "Timeout", "job_id": job_id}
-                )
-            
-            # Retrieve result from async responses
-            with async_responses_lock:
-                job_data = async_responses.get(job_id, {})
-                job_status = job_data.get("status", "unknown")
-                job_result = job_data.get("result", {})
+                    job_data = async_responses.get(job_id, {})
+                    job_status = job_data.get("status", "pending")
                 
-                # Clean up job entry
-                del async_responses[job_id]
-            
-            # Handle job errors
-            if job_status == "error":
-                error_msg = job_result.get("error", "Unknown error")
-                return (
-                    f"Error: {error_msg}",
-                    "",
-                    {"error": error_msg, "job_id": job_id}
-                )
-            
-            # Extract results from successful job
-            if job_status == "completed" and job_result:
-                transcript = job_result.get("transcript", "")
-                transliteration = job_result.get("transliteration", "")
-                metadata = job_result.get("metadata", {})
+                if job_status == "completed":
+                    # Retrieve result from async responses
+                    with async_responses_lock:
+                        job_result = job_data.get("result", {})
+                        # Clean up job entry
+                        if job_id in async_responses:
+                            del async_responses[job_id]
+                    
+                    # Extract results from successful job
+                    transcript = job_result.get("transcript", "")
+                    transliteration = job_result.get("transliteration", "")
+                    metadata = job_result.get("metadata", {})
+                    
+                    # Handle empty transcription
+                    if not transcript:
+                        yield (
+                            "(No speech detected)",
+                            "",
+                            {
+                                "status": "no_speech",
+                                "confidence": 0.0,
+                                "duration_seconds": len(audio_array) / 16000,
+                                "job_id": job_id
+                            }
+                        )
+                        return
+                    
+                    logger.info(f"Job {job_id} complete: {len(transcript)} chars transcribed")
+                    yield (transcript, transliteration, metadata)
+                    return
                 
-                # Handle empty transcription
-                if not transcript:
-                    return (
-                        "(No speech detected)",
+                elif job_status == "error":
+                    # Retrieve error result
+                    with async_responses_lock:
+                        job_result = job_data.get("result", {})
+                        # Clean up job entry
+                        if job_id in async_responses:
+                            del async_responses[job_id]
+                    
+                    error_msg = job_result.get("error", "Unknown error")
+                    yield (
+                        f"Error: {error_msg}",
                         "",
-                        {
-                            "status": "no_speech",
-                            "confidence": 0.0,
-                            "duration_seconds": len(audio_array) / 16000,
-                            "job_id": job_id
-                        }
+                        {"error": error_msg, "job_id": job_id}
                     )
+                    return
                 
-                logger.info(f"Job {job_id} complete: {len(transcript)} chars transcribed")
-                return (transcript, transliteration, metadata)
-            else:
-                return (
-                    "Error: Unexpected job status.",
+                # Job still pending - yield control back to event loop
+                await asyncio.sleep(poll_interval)
+                elapsed_time += poll_interval
+                
+                # Yield periodic status update during processing
+                yield (
+                    f"Processing... ({elapsed_time}s elapsed)",
                     "",
-                    {"error": f"Unexpected status: {job_status}", "job_id": job_id}
+                    {"status": "processing", "job_id": job_id, "elapsed_seconds": elapsed_time}
                 )
+            
+            # Timeout reached
+            logger.error(f"Job {job_id} timed out after {max_wait_time}s")
+            with async_responses_lock:
+                if job_id in async_responses:
+                    del async_responses[job_id]
+            yield (
+                "Error: Processing timed out. Please try again.",
+                "",
+                {"error": "Timeout", "job_id": job_id, "elapsed_seconds": elapsed_time}
+            )
             
         except Exception as e:
             logger.error(f"Error processing audio: {e}", exc_info=True)
@@ -213,7 +252,7 @@ def build_interface(
                 "error_type": type(e).__name__,
                 "error_message": str(e)
             }
-            return (
+            yield (
                 f"Error: {str(e)}",
                 "",
                 error_metadata
@@ -339,7 +378,7 @@ def build_interface(
             """
         )
         
-        # Wire up event handlers
+        # Wire up event handlers with async streaming support
         # Use either upload or mic input (whichever is provided)
         process_btn.click(
             fn=process_audio,
@@ -347,7 +386,7 @@ def build_interface(
             outputs=[transcript_output, translit_output, metadata_output]
         )
         
-        # Also allow mic input to trigger processing
+        # Also allow mic input to trigger processing with async streaming
         audio_mic.change(
             fn=process_audio,
             inputs=[audio_mic, model_dropdown, scheme_dropdown],
