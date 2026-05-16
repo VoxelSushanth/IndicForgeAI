@@ -7,6 +7,8 @@ upload, recording, model selection, and output display components.
 """
 
 import logging
+import threading
+import uuid
 from pathlib import Path
 from typing import Tuple, Dict, Any, Optional
 
@@ -21,13 +23,24 @@ from .transliteration import TransliterationEngine
 logger = logging.getLogger(__name__)
 
 
-def build_interface() -> gr.Blocks:
+def build_interface(
+    buffer_manager: AudioBufferManager,
+    model_cache: Dict[str, Any],
+    async_responses: Dict[str, Dict[str, Any]],
+    async_responses_lock: threading.Lock
+) -> gr.Blocks:
     """
     Build and configure the Gradio interface for ASR system.
     
     This function creates a complete Gradio Blocks application with
     audio input (upload and microphone), model configuration, and
     transcription/transliteration output displays.
+    
+    Args:
+        buffer_manager: Shared AudioBufferManager instance for enqueueing audio
+        model_cache: Global cache containing pre-loaded ASR pipelines and transliterator
+        async_responses: Thread-safe dictionary mapping job IDs to results
+        async_responses_lock: Lock for thread-safe access to async_responses
     
     Returns:
         Configured gr.Blocks instance ready to launch
@@ -47,9 +60,6 @@ def build_interface() -> gr.Blocks:
             - Clear button
     """
     
-    # Initialize shared components
-    buffer_manager = AudioBufferManager(maxsize=10)
-    
     def process_audio(
         audio_path: Optional[str],
         model_size: str,
@@ -59,7 +69,12 @@ def build_interface() -> gr.Blocks:
         Process uploaded or recorded audio through ASR pipeline.
         
         This function orchestrates the complete transcription and
-        transliteration workflow, handling errors gracefully.
+        transliteration workflow using the producer-consumer pattern:
+        1. Preprocesses audio to extract audio array
+        2. Generates a unique job ID
+        3. Enqueues audio with metadata into the buffer manager
+        4. Waits for the background worker to complete processing
+        5. Returns results from the thread-safe response dictionary
         
         Args:
             audio_path: Path to audio file (from upload or recording)
@@ -89,56 +104,107 @@ def build_interface() -> gr.Blocks:
             
             logger.info(f"Processing audio: {audio_path}, model: {model_size}")
             
-            # Initialize ASR pipeline with selected model
-            asr = ASRPipeline(model_size=model_size)
-            
-            # Preprocess audio
-            audio_array = asr.preprocess_audio(str(audio_path))
-            
-            # Enqueue audio chunk
-            buffer_manager.enqueue(audio_array)
-            
-            # Transcribe
-            transcription_result = asr.transcribe(audio_array)
-            transcript = transcription_result.get("text", "")
-            confidence = transcription_result.get("confidence", 0.0)
-            
-            # Handle empty transcription
-            if not transcript:
+            # Get ASR pipeline from cache for preprocessing
+            asr_pipeline = model_cache["asr_pipelines"].get(model_size)
+            if asr_pipeline is None:
                 return (
-                    "(No speech detected)",
+                    f"Model '{model_size}' not available in cache.",
                     "",
-                    {
-                        "status": "no_speech",
-                        "confidence": 0.0,
-                        "duration_seconds": len(audio_array) / 16000
-                    }
+                    {"error": f"Model '{model_size}' not initialized"}
                 )
             
-            # Initialize transliterator
-            transliterator = TransliterationEngine(
-                source_scheme="Tamil",
-                target_scheme=target_scheme
-            )
+            # Preprocess audio to get numpy array
+            audio_array = asr_pipeline.preprocess_audio(str(audio_path))
             
-            # Transliterate
-            transliteration = transliterator.transliterate(transcript)
+            # Generate unique job ID with model_size prefix
+            job_id = f"{model_size}_{uuid.uuid4().hex[:8]}"
             
-            # Build metadata
-            metadata = {
-                "status": "success",
-                "audio_file": str(audio_file.name),
-                "audio_duration_seconds": round(len(audio_array) / 16000, 2),
-                "model_size": model_size,
-                "target_scheme": target_scheme,
-                "confidence": round(confidence, 4),
-                "transcript_length": len(transcript),
-                "transliteration_length": len(transliteration)
-            }
+            # Create threading event for this job
+            job_event = threading.Event()
             
-            logger.info(f"Processing complete: {len(transcript)} chars transcribed")
+            # Register job in async responses dictionary
+            with async_responses_lock:
+                async_responses[job_id] = {
+                    "status": "pending",
+                    "result": None,
+                    "event": job_event
+                }
             
-            return (transcript, transliteration, metadata)
+            # Enqueue audio chunk with job metadata (Producer)
+            # Package as tuple: (audio_array, job_id, target_scheme)
+            enqueue_success = buffer_manager.enqueue((audio_array, job_id, target_scheme))
+            
+            if not enqueue_success:
+                logger.error(f"Failed to enqueue job {job_id}")
+                with async_responses_lock:
+                    del async_responses[job_id]
+                return (
+                    "Error: Audio queue is full. Please try again.",
+                    "",
+                    {"error": "Queue full", "job_id": job_id}
+                )
+            
+            logger.info(f"Job {job_id} enqueued, waiting for processing...")
+            
+            # Wait for background worker to complete (Consumer result)
+            # Timeout after 120 seconds to prevent indefinite blocking
+            completed = job_event.wait(timeout=120.0)
+            
+            if not completed:
+                logger.error(f"Job {job_id} timed out")
+                with async_responses_lock:
+                    del async_responses[job_id]
+                return (
+                    "Error: Processing timed out. Please try again.",
+                    "",
+                    {"error": "Timeout", "job_id": job_id}
+                )
+            
+            # Retrieve result from async responses
+            with async_responses_lock:
+                job_data = async_responses.get(job_id, {})
+                job_status = job_data.get("status", "unknown")
+                job_result = job_data.get("result", {})
+                
+                # Clean up job entry
+                del async_responses[job_id]
+            
+            # Handle job errors
+            if job_status == "error":
+                error_msg = job_result.get("error", "Unknown error")
+                return (
+                    f"Error: {error_msg}",
+                    "",
+                    {"error": error_msg, "job_id": job_id}
+                )
+            
+            # Extract results from successful job
+            if job_status == "completed" and job_result:
+                transcript = job_result.get("transcript", "")
+                transliteration = job_result.get("transliteration", "")
+                metadata = job_result.get("metadata", {})
+                
+                # Handle empty transcription
+                if not transcript:
+                    return (
+                        "(No speech detected)",
+                        "",
+                        {
+                            "status": "no_speech",
+                            "confidence": 0.0,
+                            "duration_seconds": len(audio_array) / 16000,
+                            "job_id": job_id
+                        }
+                    )
+                
+                logger.info(f"Job {job_id} complete: {len(transcript)} chars transcribed")
+                return (transcript, transliteration, metadata)
+            else:
+                return (
+                    "Error: Unexpected job status.",
+                    "",
+                    {"error": f"Unexpected status: {job_status}", "job_id": job_id}
+                )
             
         except Exception as e:
             logger.error(f"Error processing audio: {e}", exc_info=True)
